@@ -1,5 +1,4 @@
-bash
 #!/bin/bash
-cd "$(dirname "$0")"
+cd backend
 go build -o order-system main.go
 echo "Build successful: order-system"
