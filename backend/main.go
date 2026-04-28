@@ -332,7 +332,7 @@ func printHelp() {
 func (m *OrderManager) printStatus() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	fmt.Println("\n========== 系统状态 ==========")
+	fmt.Println("\n========== system status ==========")
 	fmt.Printf("number of robots: %d\n", len(m.robots))
 	fmt.Printf("Pending VIP orders: %d, normal orders: %d\n", len(m.vipQueue), len(m.normalQueue))
 	fmt.Printf("Total number of done orders: %d\n", len(m.completed))
