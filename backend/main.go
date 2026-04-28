@@ -16,7 +16,7 @@ import (
 
 // Order 订单结构
 type Order struct {
-	ID        string `json:"id"`
+	ID        int    `json:"id"`
 	Type      string `json:"type"` // "vip" or "normal"
 	CreatedAt int64  `json:"createdAt"`
 }
@@ -28,6 +28,7 @@ type OrderManager struct {
 	normalQueue []*Order       // 普通等待队列
 	completed   []*Order       // 已完成订单
 	processing  map[int]*Order // robot id -> 正在处理的订单
+	nextOrderID int32          // 下一个订单ID（自增）
 	nextRobotID int32
 	robots      map[int]*Robot
 	robotOrder  []int // 记录机器人创建顺序（用于移除最新的）
@@ -44,10 +45,7 @@ type Robot struct {
 }
 
 var (
-	seqMutex  sync.Mutex
-	lastSeq   int
-	lastMsKey string
-	manager   *OrderManager
+	manager *OrderManager
 )
 
 // 初始化
@@ -63,6 +61,7 @@ func init() {
 		processing:  make(map[int]*Order),
 		robots:      make(map[int]*Robot),
 		robotOrder:  []int{},
+		nextOrderID: 0, // 改为 0，让第一个订单从 1 开始
 		nextRobotID: 1,
 		resultFile:  file,
 	}
@@ -76,7 +75,7 @@ func currentTime() string {
 
 // 记录订单完成日志
 func (m *OrderManager) logCompletion(order *Order) {
-	line := fmt.Sprintf("order %s (%s) completion time %s\n", order.ID, mapType(order.Type), currentTime())
+	line := fmt.Sprintf("order %d (%s) completion time %s\n", order.ID, mapType(order.Type), currentTime())
 	m.resultFile.WriteString(line)
 	m.resultFile.Sync()
 	log.Print(line)
@@ -89,27 +88,17 @@ func mapType(t string) string {
 	return "Normal"
 }
 
-// 生成20位订单号：17位毫秒时间戳 + 3位序列号
-func generateOrderID() string {
-	seqMutex.Lock()
-	defer seqMutex.Unlock()
-	now := time.Now()
-	msKey := now.Format("20060102150405") + fmt.Sprintf("%03d", now.Nanosecond()/1e6)
-	if msKey != lastMsKey {
-		lastMsKey = msKey
-		lastSeq = 0
-	}
-	lastSeq++
-	seqPart := fmt.Sprintf("%03d", lastSeq%1000)
-	return msKey + seqPart
-}
-
 // 添加普通订单
 func (m *OrderManager) AddNormalOrder() *Order {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	order := &Order{ID: generateOrderID(), Type: "normal", CreatedAt: time.Now().UnixNano()}
+	order := &Order{
+		ID:        int(atomic.AddInt32(&m.nextOrderID, 1)),
+		Type:      "normal",
+		CreatedAt: time.Now().UnixNano(),
+	}
 	m.normalQueue = append(m.normalQueue, order)
+	fmt.Printf("📝 Normal order #%d added to pending area\n", order.ID)
 	m.cond.Signal()
 	return order
 }
@@ -118,8 +107,13 @@ func (m *OrderManager) AddNormalOrder() *Order {
 func (m *OrderManager) AddVipOrder() *Order {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	order := &Order{ID: generateOrderID(), Type: "vip", CreatedAt: time.Now().UnixNano()}
+	order := &Order{
+		ID:        int(atomic.AddInt32(&m.nextOrderID, 1)),
+		Type:      "vip",
+		CreatedAt: time.Now().UnixNano(),
+	}
 	m.vipQueue = append(m.vipQueue, order)
+	fmt.Printf("🌟 VIP order #%d added to pending area (priority over normal orders)\n", order.ID)
 	m.cond.Signal()
 	return order
 }
@@ -139,6 +133,7 @@ func (m *OrderManager) GetOrder(robotID int, stop <-chan struct{}) *Order {
 		}
 		if order != nil {
 			m.processing[robotID] = order
+			fmt.Printf("🤖 Robot #%d started processing order #%d\n", robotID, order.ID)
 			return order
 		}
 		m.cond.Wait()
@@ -178,6 +173,7 @@ func (m *OrderManager) ReturnOrder(robotID int) {
 	} else {
 		m.normalQueue = append([]*Order{order}, m.normalQueue...)
 	}
+	fmt.Printf("⚠️ Robot #%d removed, order #%d returned to pending queue head\n", robotID, order.ID)
 	m.cond.Signal()
 }
 
@@ -195,6 +191,7 @@ func (m *OrderManager) AddRobot() int {
 	m.robots[id] = robot
 	m.robotOrder = append(m.robotOrder, id)
 	go robot.run()
+	fmt.Printf("🤖 + Robot #%d added, total robots: %d\n", id, len(m.robots))
 	return id
 }
 
@@ -203,13 +200,13 @@ func (m *OrderManager) RemoveRobot() bool {
 	m.mu.Lock()
 	if len(m.robotOrder) == 0 {
 		m.mu.Unlock()
+		fmt.Println("⚠️ No robots to remove")
 		return false
 	}
 	lastID := m.robotOrder[len(m.robotOrder)-1]
 	m.robotOrder = m.robotOrder[:len(m.robotOrder)-1]
 	robot := m.robots[lastID]
 	delete(m.robots, lastID)
-	// 先释放锁，然后关闭 channel 并广播
 	m.mu.Unlock()
 
 	close(robot.cancel)
@@ -219,6 +216,7 @@ func (m *OrderManager) RemoveRobot() bool {
 	m.mu.Unlock()
 
 	<-robot.done
+	fmt.Printf("🗑️ Robot #%d removed, remaining robots: %d\n", lastID, len(m.robots))
 	return true
 }
 
@@ -245,7 +243,7 @@ type State struct {
 	PendingOrders []*Order `json:"pendingOrders"`
 	Completed     []*Order `json:"completed"`
 	RobotCount    int      `json:"robotCount"`
-	Processing    []string `json:"processing"`
+	Processing    []int    `json:"processing"` // 正在处理的订单 ID
 }
 
 func (m *OrderManager) GetState() State {
@@ -254,7 +252,7 @@ func (m *OrderManager) GetState() State {
 	pending := make([]*Order, 0, len(m.vipQueue)+len(m.normalQueue))
 	pending = append(pending, m.vipQueue...)
 	pending = append(pending, m.normalQueue...)
-	processingIDs := make([]string, 0, len(m.processing))
+	processingIDs := make([]int, 0, len(m.processing))
 	for _, o := range m.processing {
 		processingIDs = append(processingIDs, o.ID)
 	}
@@ -339,7 +337,7 @@ func (m *OrderManager) printStatus() {
 	if len(m.processing) > 0 {
 		fmt.Print("Orders in process: ")
 		for _, o := range m.processing {
-			fmt.Printf("%s ", o.ID)
+			fmt.Printf("%d ", o.ID)
 		}
 		fmt.Println()
 	}
@@ -354,10 +352,10 @@ func (m *OrderManager) listPending() {
 		fmt.Println("  nothing")
 	} else {
 		for _, o := range m.vipQueue {
-			fmt.Printf("  VIP   %s\n", o.ID)
+			fmt.Printf("  VIP   %d\n", o.ID)
 		}
 		for _, o := range m.normalQueue {
-			fmt.Printf("  Normal  %s\n", o.ID)
+			fmt.Printf("  Normal  %d\n", o.ID)
 		}
 	}
 }
@@ -370,7 +368,7 @@ func (m *OrderManager) listCompleted() {
 		fmt.Println("  nothing")
 	} else {
 		for _, o := range m.completed {
-			fmt.Printf("  %s %s\n", mapType(o.Type), o.ID)
+			fmt.Printf("  %s %d\n", mapType(o.Type), o.ID)
 		}
 	}
 }
@@ -397,7 +395,7 @@ func startCLI() {
 		switch cmd {
 		case "new", "n":
 			if len(parts) < 2 {
-				fmt.Println("用法: new normal|vip")
+				fmt.Println("Usage: new normal|vip")
 				continue
 			}
 			switch parts[1] {
@@ -422,7 +420,7 @@ func startCLI() {
 			}
 		case "list", "l":
 			if len(parts) < 2 {
-				fmt.Println("Unknown list, use pending or done")
+				fmt.Println("Usage: list pending|done")
 				continue
 			}
 			switch parts[1] {
@@ -438,7 +436,7 @@ func startCLI() {
 		case "help", "h":
 			printHelp()
 		case "exit", "q":
-			fmt.Println("exit！")
+			fmt.Println("Goodbye!")
 			return
 		default:
 			fmt.Println("Unknown command. Type help to view help")

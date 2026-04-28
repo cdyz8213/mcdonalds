@@ -28,19 +28,19 @@ func TestOrderPriority(t *testing.T) {
 	// 模拟机器人获取
 	order := m.GetOrder(1, nil)
 	if order.ID != vip1.ID {
-		t.Errorf("期望 VIP1，得到 %s", order.ID)
+		t.Errorf("期望 VIP1，得到 %d", order.ID)
 	}
 	order = m.GetOrder(1, nil)
 	if order.ID != vip2.ID {
-		t.Errorf("期望 VIP2，得到 %s", order.ID)
+		t.Errorf("期望 VIP2，得到 %d", order.ID)
 	}
 	order = m.GetOrder(1, nil)
 	if order.ID != normal1.ID {
-		t.Errorf("期望 Normal1，得到 %s", order.ID)
+		t.Errorf("期望 Normal1，得到 %d", order.ID)
 	}
 	order = m.GetOrder(1, nil)
 	if order.ID != normal2.ID {
-		t.Errorf("期望 Normal2，得到 %s", order.ID)
+		t.Errorf("期望 Normal2，得到 %d", order.ID)
 	}
 }
 
@@ -257,20 +257,6 @@ func TestRemoveRobot(t *testing.T) {
 	}
 }
 
-func TestGenerateOrderID(t *testing.T) {
-	ids := make(map[string]bool)
-	for i := 0; i < 1000; i++ {
-		id := generateOrderID()
-		if ids[id] {
-			t.Errorf("重复的订单ID: %s", id)
-		}
-		ids[id] = true
-		if len(id) != 20 {
-			t.Errorf("订单ID长度不是20: %s (长度: %d)", id, len(id))
-		}
-	}
-}
-
 func TestGetState(t *testing.T) {
 	m := &OrderManager{
 		vipQueue:    []*Order{},
@@ -298,10 +284,10 @@ func TestGetState(t *testing.T) {
 		t.Errorf("期望1个待处理订单，得到 %d", len(state.PendingOrders))
 	}
 	if state.PendingOrders[0].ID != normal1.ID {
-		t.Errorf("期望订单 %s，得到 %s", normal1.ID, state.PendingOrders[0].ID)
+		t.Errorf("期望订单 %d，得到 %d", normal1.ID, state.PendingOrders[0].ID)
 	}
 	if len(state.Processing) != 1 || state.Processing[0] != vip1.ID {
-		t.Errorf("期望处理中的订单为%s，得到 %v", vip1.ID, state.Processing)
+		t.Errorf("期望处理中的订单为%d，得到 %v", vip1.ID, state.Processing)
 	}
 	if state.RobotCount != 1 {
 		t.Errorf("期望1个机器人，得到 %d", state.RobotCount)
