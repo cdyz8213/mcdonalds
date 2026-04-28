@@ -1,0 +1,461 @@
+package main
+
+import (
+	"bufio"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// Order 订单结构
+type Order struct {
+	ID        string `json:"id"`
+	Type      string `json:"type"` // "vip" or "normal"
+	CreatedAt int64  `json:"createdAt"`
+}
+
+// OrderManager 管理器
+type OrderManager struct {
+	mu          sync.Mutex
+	vipQueue    []*Order       // VIP 等待队列（头部优先）
+	normalQueue []*Order       // 普通等待队列
+	completed   []*Order       // 已完成订单
+	processing  map[int]*Order // robot id -> 正在处理的订单
+	nextRobotID int32
+	robots      map[int]*Robot
+	robotOrder  []int // 记录机器人创建顺序（用于移除最新的）
+	cond        *sync.Cond
+	resultFile  *os.File
+}
+
+// Robot 机器人
+type Robot struct {
+	ID      int
+	cancel  chan struct{}
+	done    chan struct{}
+	manager *OrderManager
+}
+
+var (
+	seqMutex  sync.Mutex
+	lastSeq   int
+	lastMsKey string
+	manager   *OrderManager
+)
+
+// 初始化
+func init() {
+	file, err := os.OpenFile("result.txt", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		panic("Unable to create result.txt: " + err.Error())
+	}
+	manager = &OrderManager{
+		vipQueue:    []*Order{},
+		normalQueue: []*Order{},
+		completed:   []*Order{},
+		processing:  make(map[int]*Order),
+		robots:      make(map[int]*Robot),
+		robotOrder:  []int{},
+		nextRobotID: 1,
+		resultFile:  file,
+	}
+	manager.cond = sync.NewCond(&manager.mu)
+}
+
+// 获取当前时间 HH:MM:SS
+func currentTime() string {
+	return time.Now().Format("15:04:05")
+}
+
+// 记录订单完成日志
+func (m *OrderManager) logCompletion(order *Order) {
+	line := fmt.Sprintf("order %s (%s) completion time %s\n", order.ID, mapType(order.Type), currentTime())
+	m.resultFile.WriteString(line)
+	m.resultFile.Sync()
+	log.Print(line)
+}
+
+func mapType(t string) string {
+	if t == "vip" {
+		return "VIP"
+	}
+	return "Normal"
+}
+
+// 生成20位订单号：17位毫秒时间戳 + 3位序列号
+func generateOrderID() string {
+	seqMutex.Lock()
+	defer seqMutex.Unlock()
+	now := time.Now()
+	msKey := now.Format("20060102150405") + fmt.Sprintf("%03d", now.Nanosecond()/1e6)
+	if msKey != lastMsKey {
+		lastMsKey = msKey
+		lastSeq = 0
+	}
+	lastSeq++
+	seqPart := fmt.Sprintf("%03d", lastSeq%1000)
+	return msKey + seqPart
+}
+
+// 添加普通订单
+func (m *OrderManager) AddNormalOrder() *Order {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	order := &Order{ID: generateOrderID(), Type: "normal", CreatedAt: time.Now().UnixNano()}
+	m.normalQueue = append(m.normalQueue, order)
+	m.cond.Signal()
+	return order
+}
+
+// 添加 VIP 订单
+func (m *OrderManager) AddVipOrder() *Order {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	order := &Order{ID: generateOrderID(), Type: "vip", CreatedAt: time.Now().UnixNano()}
+	m.vipQueue = append(m.vipQueue, order)
+	m.cond.Signal()
+	return order
+}
+
+// 机器人获取订单（阻塞）
+func (m *OrderManager) GetOrder(robotID int, stop <-chan struct{}) *Order {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for {
+		var order *Order
+		if len(m.vipQueue) > 0 {
+			order = m.vipQueue[0]
+			m.vipQueue = m.vipQueue[1:]
+		} else if len(m.normalQueue) > 0 {
+			order = m.normalQueue[0]
+			m.normalQueue = m.normalQueue[1:]
+		}
+		if order != nil {
+			m.processing[robotID] = order
+			return order
+		}
+		m.cond.Wait()
+		select {
+		case <-stop:
+			return nil
+		default:
+		}
+	}
+}
+
+// 完成订单
+func (m *OrderManager) CompleteOrder(robotID int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	order, ok := m.processing[robotID]
+	if !ok {
+		return
+	}
+	delete(m.processing, robotID)
+	m.completed = append(m.completed, order)
+	m.logCompletion(order)
+	m.cond.Signal()
+}
+
+// 归还订单（机器人被移除时）
+func (m *OrderManager) ReturnOrder(robotID int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	order, ok := m.processing[robotID]
+	if !ok {
+		return
+	}
+	delete(m.processing, robotID)
+	if order.Type == "vip" {
+		m.vipQueue = append([]*Order{order}, m.vipQueue...)
+	} else {
+		m.normalQueue = append([]*Order{order}, m.normalQueue...)
+	}
+	m.cond.Signal()
+}
+
+// 添加机器人
+func (m *OrderManager) AddRobot() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	id := int(atomic.AddInt32(&m.nextRobotID, 1))
+	robot := &Robot{
+		ID:      id,
+		cancel:  make(chan struct{}),
+		done:    make(chan struct{}),
+		manager: m,
+	}
+	m.robots[id] = robot
+	m.robotOrder = append(m.robotOrder, id)
+	go robot.run()
+	return id
+}
+
+// 移除最新机器人
+func (m *OrderManager) RemoveRobot() bool {
+	m.mu.Lock()
+	if len(m.robotOrder) == 0 {
+		m.mu.Unlock()
+		return false
+	}
+	lastID := m.robotOrder[len(m.robotOrder)-1]
+	m.robotOrder = m.robotOrder[:len(m.robotOrder)-1]
+	robot := m.robots[lastID]
+	delete(m.robots, lastID)
+	// 先释放锁，然后关闭 channel 并广播
+	m.mu.Unlock()
+
+	close(robot.cancel)
+	// 广播唤醒可能正在等待的机器人
+	m.mu.Lock()
+	m.cond.Broadcast()
+	m.mu.Unlock()
+
+	<-robot.done
+	return true
+}
+
+// 机器人运行逻辑
+func (r *Robot) run() {
+	defer close(r.done)
+	for {
+		order := r.manager.GetOrder(r.ID, r.cancel)
+		if order == nil {
+			return
+		}
+		select {
+		case <-time.After(10 * time.Second):
+			r.manager.CompleteOrder(r.ID)
+		case <-r.cancel:
+			r.manager.ReturnOrder(r.ID)
+			return
+		}
+	}
+}
+
+// ========== HTTP 模式相关 ==========
+type State struct {
+	PendingOrders []*Order `json:"pendingOrders"`
+	Completed     []*Order `json:"completed"`
+	RobotCount    int      `json:"robotCount"`
+	Processing    []string `json:"processing"`
+}
+
+func (m *OrderManager) GetState() State {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	pending := make([]*Order, 0, len(m.vipQueue)+len(m.normalQueue))
+	pending = append(pending, m.vipQueue...)
+	pending = append(pending, m.normalQueue...)
+	processingIDs := make([]string, 0, len(m.processing))
+	for _, o := range m.processing {
+		processingIDs = append(processingIDs, o.ID)
+	}
+	return State{
+		PendingOrders: pending,
+		Completed:     m.completed,
+		RobotCount:    len(m.robots),
+		Processing:    processingIDs,
+	}
+}
+
+func enableCORS(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		next(w, r)
+	}
+}
+
+func handleNormalOrder(w http.ResponseWriter, r *http.Request) {
+	order := manager.AddNormalOrder()
+	json.NewEncoder(w).Encode(order)
+}
+
+func handleVipOrder(w http.ResponseWriter, r *http.Request) {
+	order := manager.AddVipOrder()
+	json.NewEncoder(w).Encode(order)
+}
+
+func handleAddBot(w http.ResponseWriter, r *http.Request) {
+	id := manager.AddRobot()
+	json.NewEncoder(w).Encode(map[string]int{"botId": id})
+}
+
+func handleRemoveBot(w http.ResponseWriter, r *http.Request) {
+	ok := manager.RemoveRobot()
+	json.NewEncoder(w).Encode(map[string]bool{"success": ok})
+}
+
+func handleState(w http.ResponseWriter, r *http.Request) {
+	state := manager.GetState()
+	json.NewEncoder(w).Encode(state)
+}
+
+func startHTTPServer() {
+	http.HandleFunc("/api/order/normal", enableCORS(handleNormalOrder))
+	http.HandleFunc("/api/order/vip", enableCORS(handleVipOrder))
+	http.HandleFunc("/api/bot/add", enableCORS(handleAddBot))
+	http.HandleFunc("/api/bot/remove", enableCORS(handleRemoveBot))
+	http.HandleFunc("/api/state", enableCORS(handleState))
+	log.Println("HTTP Server starting on :8080")
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+
+// ========== CLI 模式相关 ==========
+func printHelp() {
+	fmt.Println("\n🍔 McDonald's order processing system CLI")
+	fmt.Println("command list (support short):")
+	fmt.Println("  new normal / n normal(n)  - Add a normal order")
+	fmt.Println("  new vip    / n vip(v)     - Add a vip order")
+	fmt.Println("  add bot    / ab bot       - Add a bot")
+	fmt.Println("  remove bot / rb bot       - Remove a bot")
+	fmt.Println("  list pending / l pending(p) - List pending orders")
+	fmt.Println("  list done    / l done(d)  - List done orders")
+	fmt.Println("  status       / s          - View system status")
+	fmt.Println("  help         / h          - Help")
+	fmt.Println("  exit         / q          - Exit")
+}
+
+func (m *OrderManager) printStatus() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	fmt.Println("\n========== 系统状态 ==========")
+	fmt.Printf("number of robots: %d\n", len(m.robots))
+	fmt.Printf("Pending VIP orders: %d, normal orders: %d\n", len(m.vipQueue), len(m.normalQueue))
+	fmt.Printf("Total number of done orders: %d\n", len(m.completed))
+	if len(m.processing) > 0 {
+		fmt.Print("Orders in process: ")
+		for _, o := range m.processing {
+			fmt.Printf("%s ", o.ID)
+		}
+		fmt.Println()
+	}
+	fmt.Println("==============================")
+}
+
+func (m *OrderManager) listPending() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	fmt.Println("\n[Pending orders]")
+	if len(m.vipQueue) == 0 && len(m.normalQueue) == 0 {
+		fmt.Println("  nothing")
+	} else {
+		for _, o := range m.vipQueue {
+			fmt.Printf("  VIP   %s\n", o.ID)
+		}
+		for _, o := range m.normalQueue {
+			fmt.Printf("  Normal  %s\n", o.ID)
+		}
+	}
+}
+
+func (m *OrderManager) listCompleted() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	fmt.Println("\n[done orders]")
+	if len(m.completed) == 0 {
+		fmt.Println("  nothing")
+	} else {
+		for _, o := range m.completed {
+			fmt.Printf("  %s %s\n", mapType(o.Type), o.ID)
+		}
+	}
+}
+
+func startCLI() {
+	// 默认启动一个机器人（便于演示）
+	manager.AddRobot()
+	printHelp()
+	scanner := bufio.NewScanner(os.Stdin)
+	for {
+		fmt.Print("> ")
+		if !scanner.Scan() {
+			break
+		}
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		parts := strings.Fields(line)
+		if len(parts) == 0 {
+			continue
+		}
+		cmd := parts[0]
+		switch cmd {
+		case "new", "n":
+			if len(parts) < 2 {
+				fmt.Println("用法: new normal|vip")
+				continue
+			}
+			switch parts[1] {
+			case "normal", "n":
+				manager.AddNormalOrder()
+			case "vip", "v":
+				manager.AddVipOrder()
+			default:
+				fmt.Println("Unknown order type, please use normal or vip")
+			}
+		case "add", "ab":
+			if len(parts) > 1 && parts[1] == "bot" {
+				manager.AddRobot()
+			} else {
+				fmt.Println("Usage: add bot")
+			}
+		case "remove", "rb":
+			if len(parts) > 1 && parts[1] == "bot" {
+				manager.RemoveRobot()
+			} else {
+				fmt.Println("Usage: remove bot")
+			}
+		case "list", "l":
+			if len(parts) < 2 {
+				fmt.Println("Unknown list, use pending or done")
+				continue
+			}
+			switch parts[1] {
+			case "pending", "p":
+				manager.listPending()
+			case "done", "d":
+				manager.listCompleted()
+			default:
+				fmt.Println("Unknown list, use pending or done")
+			}
+		case "status", "s":
+			manager.printStatus()
+		case "help", "h":
+			printHelp()
+		case "exit", "q":
+			fmt.Println("exit！")
+			return
+		default:
+			fmt.Println("Unknown command. Type help to view help")
+		}
+	}
+}
+
+// ========== 主函数 ==========
+func main() {
+	cliMode := flag.Bool("cli", false, "Start CLI interactive mode (default: start HTTP server)")
+	flag.Parse()
+
+	defer manager.resultFile.Close()
+
+	if *cliMode {
+		startCLI()
+	} else {
+		startHTTPServer()
+	}
+}
